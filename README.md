@@ -1,461 +1,280 @@
-# laser-m01-raspberrypi-bluetooth
+# M01 Laser Rangefinder for Raspberry Pi — UART + Bluetooth RFCOMM
 
-Raspberry Pi Python driver for the **M01 laser distance module (6‑pin board)** with UART, plus a Bluetooth (RFCOMM/Serial) server so phones/laptops can read distance live or send commands. Includes a CLI, systemd services, and a simple client.
+[![CI](https://github.com/Amirmobash/laser-m01-raspberrypi-bluetooth/actions/workflows/ci.yml/badge.svg)](https://github.com/Amirmobash/laser-m01-raspberrypi-bluetooth/actions/workflows/ci.yml)
 
-> This repo adapts the great ESP32 demo by **Andres-ros/laser-m01-esp32** to Raspberry Pi + Python + Bluetooth workflow.
+A small Python driver and Bluetooth bridge for the **M01 6-pin laser distance/rangefinder module** on Raspberry Pi. It talks to the module over the Pi UART, decodes the M01 binary `0xAA` measurement frames, and can expose live distance readings over **Bluetooth Classic RFCOMM** as newline-delimited JSON.
 
----
+**Deutsch:** [README.de.md](README.de.md)
 
-## Repository layout
+This repository is intentionally narrow: one driver, one CLI, one RFCOMM server, tests, and a service file. There is no web framework and no abandoned Bluetooth Python wrapper in the runtime path.
 
+## What it does
+
+- Read one distance measurement from the M01 over UART.
+- Stream measurements at a configurable rate.
+- Switch the laser emitter on and off.
+- Reset the module through `ENA` when that pin is connected to a Raspberry Pi GPIO.
+- Serve measurements to a paired Bluetooth client over RFCOMM channel 1 (configurable).
+- Emit stable JSON that is easy to consume from Android, Linux, a laptop, or another embedded computer.
+- Run as a systemd service without assuming that the Raspberry Pi username is `pi`.
+
+## Hardware and wiring
+
+The driver uses **3.3 V logic**. UART lines must be crossed.
+
+![M01 to Raspberry Pi wiring](assets/m01-raspberry-pi-wiring.svg)
+
+| M01 signal | Raspberry Pi | Header pin | Notes |
+|---|---|---:|---|
+| `MIN / 3V3` | `3V3` | 1 or 17 | Verify the power requirement of your module revision. |
+| `GND` | `GND` | e.g. 6 | Common ground is mandatory. |
+| `TXD` | `GPIO15 / RXD` | 10 | Module TX goes to Pi RX. |
+| `RXD` | `GPIO14 / TXD` | 8 | Module RX goes to Pi TX. |
+| `ENA` | `GPIO5` | 29 | Optional. Use it only if ENA is available on your harness. |
+
+The reference module harness was documented with red = 3.3 V, black = GND, yellow = TXD and green = RXD. **Do not trust wire colours blindly**; module revisions and vendor harnesses can differ.
+
+If the M01 becomes unstable when powered from the Pi 3.3 V rail, use a properly regulated external 3.3 V supply and keep the grounds common.
+
+## Raspberry Pi UART setup
+
+On Raspberry Pi OS, enable the hardware serial port and disable the login shell on it:
+
+```bash
+sudo raspi-config
 ```
-laser-m01-raspberrypi-bluetooth/
-├─ README.md
-├─ LICENSE
-├─ requirements.txt
-├─ src/
-│  └─ laser_m01/
-│     ├─ __init__.py
-│     ├─ m01.py              # UART driver & parser
-│     ├─ main.py             # CLI tool: measure / laser on-off / reset
-│     └─ bt_server.py        # Bluetooth SPP (RFCOMM) server
-├─ clients/
-│  ├─ python_spp_client.py   # Example cross‑platform client
-│  └─ android_ble_notes.md   # Notes for BLE alternative (if you prefer BLE)
-├─ systemd/
-│  ├─ laser-m01.service      # Run the CLI in streaming mode on boot (optional)
-│  └─ laser-m01-bt.service   # Run the Bluetooth server on boot
-└─ examples/
-   └─ stream_to_csv.sh       # Log distance to CSV
+
+Choose the serial interface settings, answer **No** to a login shell over serial, and **Yes** to enabling the serial hardware. Reboot afterwards.
+
+The project defaults to `/dev/serial0`, which is the preferred Raspberry Pi alias for the primary UART.
+
+Add your account to `dialout` so it can open the serial device without running the application as root:
+
+```bash
+sudo usermod -aG dialout "$USER"
 ```
 
----
+Log out and back in after changing groups.
 
-## Wiring (Pi ↔ M01, 3.3V logic)
+## Install
 
-* **M01 VCC (VIN/MIN)** → Raspberry Pi **3V3**
-* **M01 GND**           → Raspberry Pi **GND**
-* **M01 TXD**           → Raspberry Pi **GPIO15 / RXD** (physical pin 10)
-* **M01 RXD**           → Raspberry Pi **GPIO14 / TXD** (physical pin 8)
-* **M01 ENA** (if available) → Any 3V3 logic GPIO (we use **GPIO5** in code) or tie to 3V3
-
-> Important: TX of module → RX of Pi, and RX of module ← TX of Pi. Common ground is required.
-
-Enable UART on the Pi: `sudo raspi-config` → *Interface Options* → *Serial* → disable login shell over serial, **enable hardware serial**. Reboot.
-
----
-
-## Installation (Raspberry Pi OS)
+Target: Raspberry Pi OS Bookworm or newer, Python 3.11+.
 
 ```bash
 sudo apt update
-sudo apt install -y python3-pip python3-venv bluetooth bluez bluez-tools pi-bluetooth
+sudo apt install -y python3-venv bluez
+
+git clone https://github.com/Amirmobash/laser-m01-raspberrypi-bluetooth.git
+cd laser-m01-raspberrypi-bluetooth
+
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -U pip
-pip install -r requirements.txt
+python -m pip install --upgrade pip
+pip install -e .
 ```
 
-If you want the services:
+If you connected `ENA` to a GPIO and want software reset support:
 
 ```bash
-sudo cp systemd/*.service /etc/systemd/system/
-sudo systemctl daemon-reload
-# choose one or both
-sudo systemctl enable --now laser-m01.service
-sudo systemctl enable --now laser-m01-bt.service
+pip install -e ".[gpio]"
 ```
 
----
+## First measurement
 
-## Python package files
-
-### requirements.txt
-
-```
-pyserial>=3.5
-PyBluez>=0.23
-```
-
-### src/laser_m01/**init**.py
-
-```python
-__all__ = ["M01", "open_default", "M01Error"]
-from .m01 import M01, open_default, M01Error
-```
-
-### src/laser_m01/m01.py
-
-```python
-#!/usr/bin/env python3
-"""
-M01 laser distance module UART driver for Raspberry Pi.
-Assumes ASCII command interface similar to ESP32 demo:
-  Q = single measurement
-  L = laser ON
-  K = laser OFF
-  R = module reset (ENA low→high pulse handled in software via GPIO)
-Outputs typically look like b"1.234\r\n" (meters). If your unit speaks at 115200
-or returns different frames, adjust BAUDRATE and parse_line().
-"""
-from __future__ import annotations
-import time
-import re
-from dataclasses import dataclass
-from typing import Optional
-
-import serial  # pyserial
-try:
-    import RPi.GPIO as GPIO
-    _HAS_GPIO = True
-except Exception:
-    _HAS_GPIO = False
-
-FLOAT_RE = re.compile(rb"([0-9]+\.[0-9]+)")
-
-class M01Error(Exception):
-    pass
-
-@dataclass
-class M01:
-    port: str = "/dev/serial0"      # Pi's PL011 UART
-    baudrate: int = 9600              # some units use 115200
-    ena_gpio: Optional[int] = 5       # None if wired high
-    timeout: float = 0.5
-
-    def __post_init__(self):
-        self.ser = serial.Serial(self.port, self.baudrate, timeout=self.timeout)
-        if self.ena_gpio is not None and _HAS_GPIO:
-            GPIO.setmode(GPIO.BCM)
-            GPIO.setup(self.ena_gpio, GPIO.OUT, initial=GPIO.HIGH)
-
-    def close(self):
-        try:
-            self.ser.close()
-        finally:
-            if self.ena_gpio is not None and _HAS_GPIO:
-                GPIO.cleanup(self.ena_gpio)
-
-    # --- low-level helpers ---
-    def _write(self, data: bytes):
-        self.ser.write(data)
-        self.ser.flush()
-
-    def _readline(self) -> bytes:
-        return self.ser.readline()
-
-    # --- module commands ---
-    def laser_on(self):
-        self._write(b"L")
-
-    def laser_off(self):
-        self._write(b"K")
-
-    def measure_once(self) -> float:
-        """Trigger a single measurement and parse distance in meters."""
-        self._write(b"Q")
-        raw = self._readline()
-        if not raw:
-            raise M01Error("No data from module; check wiring and baudrate.")
-        m = FLOAT_RE.search(raw)
-        if not m:
-            raise M01Error(f"Unrecognized frame: {raw!r}")
-        return float(m.group(1))
-
-    def reset(self):
-        if self.ena_gpio is None or not _HAS_GPIO:
-            # fallback: send 'R' and hope module interprets; or user wired ENA to 3V3
-            self._write(b"R")
-            return
-        # Pulse ENA low then high
-        GPIO.output(self.ena_gpio, GPIO.LOW)
-        time.sleep(0.05)
-        GPIO.output(self.ena_gpio, GPIO.HIGH)
-        time.sleep(0.2)
-
-
-def open_default(**kw) -> M01:
-    return M01(**kw)
-```
-
-### src/laser_m01/main.py (CLI)
-
-```python
-#!/usr/bin/env python3
-import argparse, sys, time, json
-from .m01 import open_default, M01Error
-
-MODES = {"once", "stream"}
-
-def _print(obj):
-    sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-    sys.stdout.flush()
-
-
-def main():
-    ap = argparse.ArgumentParser(description="M01 laser module CLI")
-    ap.add_argument("mode", choices=MODES, help="once = single reading; stream = continuous readings")
-    ap.add_argument("--port", default="/dev/serial0")
-    ap.add_argument("--baud", type=int, default=9600)
-    ap.add_argument("--ena-gpio", type=int, default=5)
-    ap.add_argument("--hz", type=float, default=5.0, help="streaming rate")
-    args = ap.parse_args()
-
-    m01 = open_default(port=args.port, baudrate=args.baud, ena_gpio=args.ena_gpio)
-    try:
-        if args.mode == "once":
-            m01.laser_on()
-            d = m01.measure_once()
-            _print({"meters": d, "timestamp": time.time()})
-        else:
-            m01.laser_on()
-            period = 1.0 / max(args.hz, 0.1)
-            while True:
-                try:
-                    d = m01.measure_once()
-                    _print({"meters": d, "timestamp": time.time()})
-                except M01Error as e:
-                    _print({"error": str(e), "timestamp": time.time()})
-                time.sleep(period)
-    finally:
-        m01.laser_off()
-        m01.close()
-
-if __name__ == "__main__":
-    main()
-```
-
-### src/laser_m01/bt_server.py (Bluetooth SPP) Amir Mobasheraghdam
-
-```python
-#!/usr/bin/env python3
-"""Bluetooth RFCOMM (Serial Port Profile) server for M01 readings.
-Clients (Android, PC, etc.) connect to SPP and receive newline‑delimited JSON.
-They can also send ASCII commands: Q (once), S (start stream), P (pause), L, K, R.
-"""
-import sys, time, json, threading
-from bluetooth import BluetoothSocket, RFCOMM, advertise_service, SERIAL_PORT_CLASS, SERIAL_PORT_PROFILE
-from .m01 import open_default, M01Error
-
-SERVICE_NAME = "M01 Laser"
-SERVICE_UUID = "00001101-0000-1000-8000-00805F9B34FB"  # SPP
-
-class Server:
-    def __init__(self, port="/dev/serial0", baud=9600, ena_gpio=5, hz=5.0):
-        self.dev = open_default(port=port, baudrate=baud, ena_gpio=ena_gpio)
-        self.hz = hz
-        self.streaming = False
-        self._stop = False
-
-    def start(self):
-        self.dev.laser_on()
-        sock = BluetoothSocket(RFCOMM)
-        sock.bind(("", 1))
-        sock.listen(1)
-        advertise_service(sock, SERVICE_NAME, service_id=SERVICE_UUID,
-                          service_classes=[SERVICE_UUID, SERIAL_PORT_CLASS],
-                          profiles=[SERIAL_PORT_PROFILE])
-        print("[BT] Waiting for RFCOMM client…")
-        try:
-            client, addr = sock.accept()
-            print(f"[BT] Client connected: {addr}")
-            t = threading.Thread(target=self._tx_loop, args=(client,), daemon=True)
-            t.start()
-            # RX loop
-            while not self._stop:
-                data = client.recv(1)
-                if not data:
-                    break
-                cmd = data.decode(errors="ignore").strip().upper()
-                if cmd == "Q":
-                    self._send_one(client)
-                elif cmd == "S":
-                    self.streaming = True
-                elif cmd == "P":
-                    self.streaming = False
-                elif cmd == "L":
-                    self.dev.laser_on()
-                elif cmd == "K":
-                    self.dev.laser_off()
-                elif cmd == "R":
-                    self.dev.reset()
-        finally:
-            self.dev.laser_off()
-            self.dev.close()
-            try:
-                sock.close()
-            except Exception:
-                pass
-
-    def _tx_loop(self, client):
-        period = 1.0 / max(self.hz, 0.1)
-        while not self._stop:
-            if self.streaming:
-                try:
-                    d = self.dev.measure_once()
-                    msg = json.dumps({"meters": d, "ts": time.time()}) + "\n"
-                except M01Error as e:
-                    msg = json.dumps({"error": str(e), "ts": time.time()}) + "\n"
-                try:
-                    client.send(msg.encode())
-                except Exception:
-                    break
-            time.sleep(period)
-
-    def _send_one(self, client):
-        try:
-            d = self.dev.measure_once()
-            msg = json.dumps({"meters": d, "ts": time.time()}) + "\n"
-        except M01Error as e:
-            msg = json.dumps({"error": str(e), "ts": time.time()}) + "\n"
-        client.send(msg.encode())
-
-if __name__ == "__main__":
-    Server().start()
-```
-
----
-
-## Example client (Python)
-
-`clients/python_spp_client.py`
-
-```python
-#!/usr/bin/env python3
-"""Connect to the Raspberry Pi's SPP service and print readings."""
-import sys, time, json
-from bluetooth import BluetoothSocket, RFCOMM
-
-if len(sys.argv) < 2:
-    print("Usage: python python_spp_client.py <server-mac>")
-    sys.exit(1)
-
-mac = sys.argv[1]
-
-sock = BluetoothSocket(RFCOMM)
-sock.connect((mac, 1))
-# Start streaming
-sock.send(b"S")
-try:
-    while True:
-        line = b""
-        while not line.endswith(b"\n"):
-            chunk = sock.recv(64)
-            if not chunk:
-                raise SystemExit("Disconnected")
-            line += chunk
-        try:
-            obj = json.loads(line.decode().strip())
-        except Exception:
-            continue
-        print(obj)
-except KeyboardInterrupt:
-    sock.send(b"P")
-finally:
-    sock.close()
-```
-
----
-
-## Systemd service files
-
-### systemd/laser-m01.service
-
-```ini
-[Unit]
-Description=Laser M01 CLI streaming service
-After=network.target
-
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/laser-m01-raspberrypi-bluetooth
-ExecStart=/home/pi/laser-m01-raspberrypi-bluetooth/.venv/bin/python -m laser_m01.main stream --baud 9600 --ena-gpio 5 --hz 5
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### systemd/laser-m01-bt.service
-
-```ini
-[Unit]
-Description=Laser M01 Bluetooth RFCOMM server
-After=bluetooth.target
-Requires=bluetooth.service
-
-[Service]
-Type=simple
-User=pi
-WorkingDirectory=/home/pi/laser-m01-raspberrypi-bluetooth
-ExecStart=/home/pi/laser-m01-raspberrypi-bluetooth/.venv/bin/python -m laser_m01.bt_server
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-```
-
----
-
-## CLI usage
+The common baud rate for this module is 9600. Some units are configured differently, so 115200 is worth trying if you receive no valid frames.
 
 ```bash
-# One reading
-python -m laser_m01.main once
-# Continuous stream at 10 Hz (JSON to stdout)
-python -m laser_m01.main stream --hz 10
-# Different baudrate if your unit needs it
-python -m laser_m01.main stream --baud 115200
+m01 measure
 ```
 
-Log to CSV:
+Example:
+
+```text
+1.534 m (1534 mm)
+```
+
+JSON output:
 
 ```bash
-./examples/stream_to_csv.sh > distances.csv
+m01 measure --json
 ```
 
-`examples/stream_to_csv.sh`
+Use another serial port or baud rate if needed:
 
 ```bash
-#!/usr/bin/env bash
-python -m laser_m01.main stream | jq -r '"\(.timestamp),\(.meters)"'
+m01 measure --port /dev/ttyAMA0 --baud 115200
 ```
 
----
+## CLI
 
-## Bluetooth pairing & testing
+```bash
+# One measurement; laser is switched off again when the command finishes
+m01 measure
 
-1. Put Pi in discoverable mode:
+# Continuous output
+m01 stream --hz 5
 
-   ```bash
-   sudo bluetoothctl
-   [bluetooth]# power on
-   [bluetooth]# discoverable on
-   [bluetooth]# pairable on
-   [bluetooth]# agent on
-   [bluetooth]# default-agent
-   ```
-2. From your phone/PC, pair with the Pi (PIN may be requested).Amir Mobasheraghdam
-3. Use a serial terminal app (e.g., *Serial Bluetooth Terminal* on Android) to open the **SPP** service.
-4. Send `S` to start streaming, `P` to pause, `Q` once, and `L/K/R` for control.
+# Newline-delimited JSON
+m01 stream --hz 10 --json
 
----
+# Direct emitter control
+m01 laser on
+m01 laser off
+
+# Hardware reset through ENA on BCM GPIO 5
+m01 reset --ena-gpio 5
+
+# Bluetooth RFCOMM bridge
+m01 rfcomm-server --channel 1 --hz 5
+```
+
+The same settings can be supplied through environment variables:
+
+```text
+M01_PORT=/dev/serial0
+M01_BAUD=9600
+M01_ENA_GPIO=-1
+M01_RFCOMM_CHANNEL=1
+M01_HZ=5
+```
+
+`M01_ENA_GPIO=-1` means ENA is not controlled by software.
+
+## Bluetooth protocol
+
+The RFCOMM server accepts simple single-character commands, which makes it usable from generic serial-terminal clients:
+
+| Command | Action |
+|---|---|
+| `Q` | Take one measurement. |
+| `S` | Start streaming. |
+| `P` | Pause streaming. |
+| `L` | Laser on. |
+| `K` | Laser off. |
+| `R` | Reset through ENA. |
+| `H` | Return command help. |
+
+Messages from the server are one JSON object per line:
+
+```json
+{"type":"measurement","meters":1.534,"millimeters":1534,"timestamp":"2026-10-23T16:10:12.421Z"}
+```
+
+### Bluetooth pairing and SPP discovery
+
+Pair and trust the client using BlueZ:
+
+```bash
+bluetoothctl
+power on
+agent on
+default-agent
+pairable on
+discoverable on
+```
+
+After pairing, the Python server listens directly on the configured RFCOMM channel. Some serial-terminal applications also expect an SDP **Serial Port** record. On systems where local SDP registration is enabled, you can add one with:
+
+```bash
+sudo sdptool add --channel=1 SP
+```
+
+BlueZ configurations differ. If local `sdptool add` is disabled, do not weaken the system configuration just to satisfy this project; use a client that can connect to the known RFCOMM channel or configure SDP deliberately for your deployment.
+
+**iPhone/iPad note:** normal iOS applications do not expose generic Bluetooth Classic SPP in the same way Android/Linux clients do. A BLE GATT transport or Apple MFi accessory path is a separate implementation and is not pretended to be part of this repository.
+
+A minimal Linux client is included:
+
+```bash
+python clients/rfcomm_client.py AA:BB:CC:DD:EE:FF --command S
+```
+
+## Run on boot
+
+For a fixed installation, use the provided installer:
+
+```bash
+sudo ./scripts/install.sh
+```
+
+It installs the project to `/opt/m01-bridge`, creates a virtual environment, installs the systemd template, and adds the invoking user to `dialout`. It does **not** enable the service before you review the settings.
+
+Edit:
+
+```bash
+sudo nano /etc/default/m01-bridge
+```
+
+Then enable the service for your actual Raspberry Pi username:
+
+```bash
+sudo systemctl enable --now m01-bridge@$USER.service
+sudo systemctl status m01-bridge@$USER.service
+```
+
+Logs:
+
+```bash
+journalctl -u m01-bridge@$USER.service -f
+```
+
+## M01 binary protocol used here
+
+This implementation follows the working ESP32 reference by [Andres-ros/laser-m01-esp32](https://github.com/Andres-ros/laser-m01-esp32). The M01 is **not** controlled here by sending ASCII `Q`, `L`, `K`, or `R` to its UART. Those letters are only the human-facing commands used by the CLI/RFCOMM interface.
+
+The module commands are binary frames:
+
+```text
+Laser on:      AA 00 01 BE 00 01 00 01 C1
+Laser off:     AA 00 01 BE 00 01 00 00 C0
+Quick measure: AA 00 00 22 00 01 00 00 23
+Read result:   AA 80 00 22 A2
+```
+
+A measurement response is expected as a 13-byte frame beginning with `0xAA`. The parser validates the checksum, accepts measurement function bytes `0x20`, `0x21` or `0x22`, decodes four BCD distance bytes, and resynchronizes if noise or a damaged frame appears on the UART.
 
 ## Troubleshooting
 
-* No readings? Check **crossed TX/RX**, common **GND**, **ENA** high, and try `--baud 115200`.
-* Permission error on `/dev/serial0`? Add your user to `dialout`: `sudo usermod -aG dialout $USER` and reboot.
-* Bluetooth service won’t start? Ensure `bluetooth.service` is active, and `PyBluez` installed.
+**No data from the module**
 
----
+- Confirm module `TXD → GPIO15/RXD` and module `RXD ← GPIO14/TXD`.
+- Confirm a common ground.
+- Confirm ENA is high if your board exposes it.
+- Try both `--baud 9600` and `--baud 115200`.
+- Make sure the serial login console is disabled.
 
-## License
+**Permission denied on `/dev/serial0`**
 
-MIT
+```bash
+sudo usermod -aG dialout "$USER"
+```
 
----
+Then log out and back in.
 
-## Credits
+**Bluetooth server starts but a phone does not list an SPP service**
 
-* Original ESP32 reference and pinout notes inspired by **Andres-ros/laser-m01-esp32**.
+Pair the devices first, check that `bluetooth.service` is running, and read the SPP discovery note above. RFCOMM transport and SDP service discovery are related but separate pieces of BlueZ.
+
+**Reset says ENA is unavailable**
+
+That is intentional. The driver will not invent an undocumented UART reset command. Connect ENA to a GPIO and install the `gpio` extra, or power-cycle the sensor manually.
+
+## Tests
+
+Protocol parsing is hardware-independent and covered by tests, including checksum failure, invalid BCD data, noisy UART input and fallback read behavior.
+
+```bash
+pip install -e ".[dev]"
+pytest
+ruff check .
+```
+
+## Safety
+
+The module is a laser rangefinder and may use an infrared emitter that is difficult or impossible to see. Follow the safety classification and operating instructions for your exact module. Do not aim it at eyes or nearby reflective surfaces.
+
+## Credits and license
+
+The M01 binary command frames and working ESP32 behavior were derived from the MIT-licensed reference project [Andres-ros/laser-m01-esp32](https://github.com/Andres-ros/laser-m01-esp32). This Raspberry Pi implementation is independently structured for Python, BlueZ and Linux service operation.
+
+Released under the [MIT License](LICENSE).

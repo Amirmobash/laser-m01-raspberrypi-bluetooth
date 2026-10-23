@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="560" viewBox="0 0 1100 560" role="img" aria-labelledby="title desc">
+  <title id="title">M01 laser rangefinder to Raspberry Pi UART wiring</title>
+  <desc id="desc">Connection diagram showing 3.3 volt power, ground, crossed UART TX and RX, and optional ENA on GPIO5.</desc>
+  <style>
+    .box{fill:#fff;stroke:#222;stroke-width:3;rx:18}.head{font:700 28px system-ui,sans-serif;fill:#111}.txt{font:22px system-ui,sans-serif;fill:#222}.small{font:18px system-ui,sans-serif;fill:#555}.wire{fill:none;stroke-width:5}.pwr{stroke:#d33}.gnd{stroke:#222}.tx{stroke:#e6a000}.rx{stroke:#1686d9}.ena{stroke:#5a9c39}.pin{font:700 19px ui-monospace,monospace;fill:#111}
+  </style>
+  <rect x="55" y="65" width="380" height="420" class="box"/>
+  <text x="245" y="115" text-anchor="middle" class="head">M01 rangefinder</text>
+  <text x="95" y="180" class="pin">MIN / 3V3</text>
+  <text x="95" y="245" class="pin">GND</text>
+  <text x="95" y="310" class="pin">TXD</text>
+  <text x="95" y="375" class="pin">RXD</text>
+  <text x="95" y="440" class="pin">ENA (optional)</text>
+
+  <rect x="665" y="65" width="380" height="420" class="box"/>
+  <text x="855" y="115" text-anchor="middle" class="head">Raspberry Pi</text>
+  <text x="725" y="180" class="pin">3V3</text>
+  <text x="725" y="245" class="pin">GND</text>
+  <text x="725" y="310" class="pin">GPIO15 / RXD · pin 10</text>
+  <text x="725" y="375" class="pin">GPIO14 / TXD · pin 8</text>
+  <text x="725" y="440" class="pin">GPIO5 · pin 29</text>
+
+  <path d="M435 172 C520 172 580 172 665 172" class="wire pwr"/>
+  <path d="M435 237 C520 237 580 237 665 237" class="wire gnd"/>
+  <path d="M435 302 C520 302 580 302 665 302" class="wire tx"/>
+  <path d="M435 367 C520 367 580 367 665 367" class="wire rx"/>
+  <path d="M435 432 C520 432 580 432 665 432" class="wire ena" stroke-dasharray="12 10"/>
+
+  <text x="550" y="535" text-anchor="middle" class="small">UART is crossed: module TXD → Pi RXD, module RXD ← Pi TXD. All logic is 3.3 V.</text>
+</svg>

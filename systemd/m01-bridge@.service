@@ -1,0 +1,18 @@
+[Unit]
+Description=M01 laser rangefinder Bluetooth RFCOMM bridge
+After=bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/m01-bridge
+EnvironmentFile=-/etc/default/m01-bridge
+ExecStart=/opt/m01-bridge/.venv/bin/m01 rfcomm-server --port ${M01_PORT} --baud ${M01_BAUD} --ena-gpio ${M01_ENA_GPIO} --channel ${M01_RFCOMM_CHANNEL} --hz ${M01_HZ}
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
